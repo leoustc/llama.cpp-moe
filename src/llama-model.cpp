@@ -34,10 +34,37 @@
 #include <string>
 #include <vector>
 
+static bool llama_moe_is_expert_tensor_name(const char * tensor_name) {
+    if (tensor_name == nullptr) {
+        return false;
+    }
+    const std::string name(tensor_name);
+    return name.find(".ffn_gate_exps.")    != std::string::npos ||
+           name.find(".ffn_down_exps.")    != std::string::npos ||
+           name.find(".ffn_up_exps.")      != std::string::npos ||
+           name.find(".ffn_gate_up_exps.") != std::string::npos;
+}
+
+static bool llama_moe_should_keep_expert_on_host(
+        bool expert_slot_mode_enabled,
+        const ggml_tensor * tensor,
+        const char * tensor_name) {
+    if (!expert_slot_mode_enabled) {
+        return false;
+    }
+    return tensor != nullptr && llama_moe_is_expert_tensor_name(tensor_name);
+}
+
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata) {
     const llama_meta_device_get_split_state_userdata * ud = (const llama_meta_device_get_split_state_userdata *) userdata;
     const llama_hparams & hparams = ud->model->hparams;
     const std::string tensor_name = tensor->name;
+    static bool moe_host_policy_log_once = false;
+    if (!moe_host_policy_log_once &&
+        llama_moe_should_keep_expert_on_host(ud->model->moe_gpu_expert_cache.enabled(), tensor, tensor->name)) {
+        LLAMA_LOG_INFO("%s: MoE expert-slot mode: expert tensor candidate kept host-resident: %s\n", __func__, tensor->name);
+        moe_host_policy_log_once = true;
+    }
 
     const std::regex pattern_q_weight        ("blk\\.\\d*\\.attn_q.weight");
     const std::regex pattern_kv_weight       ("blk\\.\\d*\\.attn_(k|v).weight");
