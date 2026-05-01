@@ -528,6 +528,10 @@ struct llama_moe_gpu_expert_cache {
         n_slots = n > 0 ? n : 0;
         slots.clear();
         slots.resize(n_slots);
+        clock = 0;
+        n_hit = 0;
+        n_miss = 0;
+        n_evict = 0;
     }
 
     void clear() {

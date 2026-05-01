@@ -1465,11 +1465,6 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
 
-    if (params.n_moe_gpu_expert_slot_num > 0) {
-        LOG_INF("%s: MoE GPU expert slot mode enabled: %d slots\n",
-                __func__, params.n_moe_gpu_expert_slot_num);
-    }
-
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
     } else {
