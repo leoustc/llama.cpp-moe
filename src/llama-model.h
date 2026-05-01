@@ -509,6 +509,41 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+struct llama_moe_gpu_expert_slot {
+    int32_t layer_id  = -1;
+    int32_t expert_id = -1;
+    int64_t last_used = 0;
+    bool resident     = false;
+};
+
+struct llama_moe_gpu_expert_cache {
+    int32_t n_slots = 0;
+    std::vector<llama_moe_gpu_expert_slot> slots;
+
+    void init(int32_t n) {
+        n_slots = n > 0 ? n : 0;
+        slots.clear();
+        slots.resize(n_slots);
+    }
+
+    void clear() {
+        n_slots = 0;
+        slots.clear();
+    }
+
+    bool enabled() const {
+        return n_slots > 0;
+    }
+
+    int32_t size() const {
+        return n_slots;
+    }
+
+    bool empty() const {
+        return n_slots == 0;
+    }
+};
+
 struct llama_model {
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
@@ -573,6 +608,8 @@ struct llama_model {
 
     // statically allocated context for assigning
     struct llama_meta_device_get_split_state_userdata get_split_state_ud;
+
+    llama_moe_gpu_expert_cache moe_gpu_expert_cache;
 
     int64_t t_load_us  = 0;
     int64_t t_start_us = 0;
