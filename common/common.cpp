@@ -1454,6 +1454,7 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;
+    mparams.n_moe_gpu_expert_slot_num = params.n_moe_gpu_expert_slot_num;
     mparams.main_gpu        = params.main_gpu;
     mparams.split_mode      = params.split_mode;
     mparams.tensor_split    = params.tensor_split;
@@ -1463,6 +1464,11 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
     mparams.check_tensors   = params.check_tensors;
     mparams.use_extra_bufts = !params.no_extra_bufts;
     mparams.no_host         = params.no_host;
+
+    if (params.n_moe_gpu_expert_slot_num > 0) {
+        LOG_INF("%s: MoE GPU expert slot mode enabled: %d slots\n",
+                __func__, params.n_moe_gpu_expert_slot_num);
+    }
 
     if (params.kv_overrides.empty()) {
         mparams.kv_overrides = NULL;
