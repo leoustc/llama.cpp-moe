@@ -168,6 +168,100 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
     return 0;
 }
 
+
+static const char * llama_moe_expert_layout_name(const llama_layer & layer) {
+    const bool has_gate_up = layer.ffn_gate_up_exps || layer.ffn_gate_up_exps_b;
+    const bool has_sep = layer.ffn_gate_exps || layer.ffn_up_exps || layer.ffn_down_exps ||
+                         layer.ffn_gate_exps_b || layer.ffn_up_exps_b || layer.ffn_down_exps_b;
+
+    if (has_gate_up && has_sep) {
+        return "unknown";
+    }
+    if (has_gate_up) {
+        return "fused";
+    }
+    if (has_sep) {
+        return "separate";
+    }
+    return "unknown";
+}
+
+static int32_t llama_moe_expert_count_from_tensor(const ggml_tensor * t) {
+    if (t == nullptr) {
+        return -1;
+    }
+
+    for (int i = GGML_MAX_DIMS - 1; i >= 0; --i) {
+        if (t->ne[i] > 1) {
+            return (int32_t) t->ne[i];
+        }
+    }
+
+    return -1;
+}
+
+static int32_t llama_moe_expert_count_from_layer(const llama_layer & layer) {
+    const ggml_tensor * candidates[] = {
+        layer.ffn_gate_exps, layer.ffn_down_exps, layer.ffn_up_exps, layer.ffn_gate_up_exps,
+        layer.ffn_gate_exps_b, layer.ffn_down_exps_b, layer.ffn_up_exps_b, layer.ffn_gate_up_exps_b,
+        layer.ffn_gate_exps_s, layer.ffn_down_exps_s, layer.ffn_up_exps_s,
+    };
+
+    for (const ggml_tensor * t : candidates) {
+        const int32_t n = llama_moe_expert_count_from_tensor(t);
+        if (n > 0) {
+            return n;
+        }
+    }
+
+    return -1;
+}
+
+static void llama_log_moe_expert_tensor_index(const llama_model & model) {
+    auto & cache = const_cast<llama_model &>(model).moe_gpu_expert_cache;
+    int64_t step = 1;
+
+    for (size_t i = 0; i < model.layers.size(); ++i) {
+        const auto & layer = model.layers[i];
+        if (!(layer.ffn_gate_exps || layer.ffn_down_exps || layer.ffn_up_exps || layer.ffn_gate_up_exps ||
+              layer.ffn_gate_exps_b || layer.ffn_down_exps_b || layer.ffn_up_exps_b || layer.ffn_gate_up_exps_b ||
+              layer.ffn_gate_exps_s || layer.ffn_down_exps_s || layer.ffn_up_exps_s)) {
+            continue;
+        }
+
+        const char * layout = llama_moe_expert_layout_name(layer);
+        const int32_t n_experts = llama_moe_expert_count_from_layer(layer);
+
+        LLAMA_LOG_INFO("%s: layer %zu: MoE tensors found\n", __func__, i);
+        LLAMA_LOG_INFO("%s: layer %zu: expert tensor layout = %s\n", __func__, i, layout);
+        if (n_experts > 0) {
+            LLAMA_LOG_INFO("%s: layer %zu: n_experts = %d\n", __func__, i, n_experts);
+        } else {
+            LLAMA_LOG_INFO("%s: layer %zu: n_experts = unknown\n", __func__, i);
+        }
+
+        if (cache.enabled() && n_experts > 0) {
+            const int32_t layer_id = (int32_t) i;
+            const int32_t expert_id = 0; // synthetic Stage-4 hook until router-selected IDs are wired
+            const int32_t hit_slot = cache.find(layer_id, expert_id);
+            if (hit_slot >= 0) {
+                cache.get_or_assign_slot(layer_id, expert_id, step++);
+                LLAMA_LOG_INFO("%s: MoE expert slot hit: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, hit_slot);
+            } else {
+                int32_t slot = cache.find_free();
+                if (slot < 0) {
+                    slot = cache.find_lru_victim();
+                    if (slot >= 0 && cache.slots[slot].resident) {
+                        LLAMA_LOG_INFO("%s: MoE expert slot evict: slot=%d old_layer=%d old_expert=%d new_layer=%d new_expert=%d\n",
+                                __func__, slot, cache.slots[slot].layer_id, cache.slots[slot].expert_id, layer_id, expert_id);
+                    }
+                }
+                const int32_t assigned = cache.get_or_assign_slot(layer_id, expert_id, step++);
+                LLAMA_LOG_INFO("%s: MoE expert slot miss: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, assigned >= 0 ? assigned : slot);
+            }
+        }
+    }
+}
 static bool llama_model_has_moe_experts(const llama_model & model) {
     for (const auto & layer : model.layers) {
         if (layer.ffn_gate_exps     ||
@@ -403,6 +497,7 @@ static struct llama_model * llama_model_load_from_file_impl(
     } else {
         model->moe_gpu_expert_cache.init(requested_slots);
         LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots\n", __func__, requested_slots);
+        llama_log_moe_expert_tensor_index(*model);
     }
 
     return model;

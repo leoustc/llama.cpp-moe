@@ -519,6 +519,10 @@ struct llama_moe_gpu_expert_slot {
 struct llama_moe_gpu_expert_cache {
     int32_t n_slots = 0;
     std::vector<llama_moe_gpu_expert_slot> slots;
+    int64_t clock = 0;
+    int64_t n_hit = 0;
+    int64_t n_miss = 0;
+    int64_t n_evict = 0;
 
     void init(int32_t n) {
         n_slots = n > 0 ? n : 0;
@@ -529,6 +533,10 @@ struct llama_moe_gpu_expert_cache {
     void clear() {
         n_slots = 0;
         slots.clear();
+        clock = 0;
+        n_hit = 0;
+        n_miss = 0;
+        n_evict = 0;
     }
 
     bool enabled() const {
@@ -541,6 +549,67 @@ struct llama_moe_gpu_expert_cache {
 
     bool empty() const {
         return n_slots == 0;
+    }
+
+    int32_t find(int32_t layer_id, int32_t expert_id) const {
+        for (int32_t i = 0; i < n_slots; ++i) {
+            const auto & slot = slots[i];
+            if (slot.resident && slot.layer_id == layer_id && slot.expert_id == expert_id) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    int32_t find_free() const {
+        for (int32_t i = 0; i < n_slots; ++i) {
+            if (!slots[i].resident) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    int32_t find_lru_victim() const {
+        if (n_slots <= 0) {
+            return -1;
+        }
+        int32_t victim = 0;
+        for (int32_t i = 1; i < n_slots; ++i) {
+            if (slots[i].last_used < slots[victim].last_used) {
+                victim = i;
+            }
+        }
+        return victim;
+    }
+
+    int32_t get_or_assign_slot(int32_t layer_id, int32_t expert_id, int64_t step) {
+        clock = std::max(clock, step);
+
+        const int32_t hit_slot = find(layer_id, expert_id);
+        if (hit_slot >= 0) {
+            ++n_hit;
+            slots[hit_slot].last_used = step;
+            return hit_slot;
+        }
+
+        ++n_miss;
+        int32_t slot = find_free();
+        if (slot < 0) {
+            slot = find_lru_victim();
+            if (slot >= 0 && slots[slot].resident) {
+                ++n_evict;
+            }
+        }
+
+        if (slot >= 0) {
+            auto & s = slots[slot];
+            s.layer_id = layer_id;
+            s.expert_id = expert_id;
+            s.last_used = step;
+            s.resident = true;
+        }
+        return slot;
     }
 };
 
