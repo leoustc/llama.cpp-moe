@@ -2339,6 +2339,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_N_GPU_LAYERS"));
     add_opt(common_arg(
+        {"--moe-gpu-expert-slot-num"}, "N",
+        "number of GPU-resident MoE expert slots for router-aware expert paging (default: 0, disabled)",
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--moe-gpu-expert-slot-num must be >= 0");
+            }
+            params.n_moe_gpu_expert_slot_num = value;
+        }
+    ));
+    add_opt(common_arg(
         {"-sm", "--split-mode"}, "{none,layer,row,tensor}",
         "how to split the model across multiple GPUs, one of:\n"
         "- none: use one GPU only\n"
