@@ -168,6 +168,22 @@ static int llama_model_load(struct gguf_context * metadata, llama_model_set_tens
     return 0;
 }
 
+static bool llama_model_has_moe_experts(const llama_model & model) {
+    for (const auto & layer : model.layers) {
+        if (layer.ffn_gate_exps     ||
+            layer.ffn_down_exps     ||
+            layer.ffn_up_exps       ||
+            layer.ffn_gate_up_exps  ||
+            layer.ffn_gate_exps_b   ||
+            layer.ffn_down_exps_b   ||
+            layer.ffn_up_exps_b     ||
+            layer.ffn_gate_up_exps_b) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static struct llama_model * llama_model_load_from_file_impl(
         struct gguf_context * metadata,
         llama_model_set_tensor_data_t set_tensor_data,
@@ -378,6 +394,17 @@ static struct llama_model * llama_model_load_from_file_impl(
         return nullptr;
     }
 
+    const int32_t requested_slots = params.n_moe_gpu_expert_slot_num;
+    if (requested_slots <= 0) {
+        model->moe_gpu_expert_cache.clear();
+    } else if (!llama_model_has_moe_experts(*model)) {
+        LLAMA_LOG_INFO("%s: MoE GPU expert slot mode requested, but model has no MoE experts; ignoring\n", __func__);
+        model->moe_gpu_expert_cache.clear();
+    } else {
+        model->moe_gpu_expert_cache.init(requested_slots);
+        LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots\n", __func__, requested_slots);
+    }
+
     return model;
 }
 
@@ -555,4 +582,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-
