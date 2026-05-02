@@ -237,6 +237,37 @@ bool llm_graph_input_moe_gpu_slot_map::can_reuse(const llm_graph_params & params
     return res;
 }
 
+static void llm_moe_gpu_slot_remap(
+        ggml_tensor * dst,
+        const ggml_tensor * a,
+        int ith,
+        int nth,
+        void * userdata) {
+    GGML_UNUSED(nth);
+
+    if (ith != 0) {
+        return;
+    }
+
+    auto * remap = static_cast<llm_moe_gpu_slot_remap_userdata *>(userdata);
+    if (remap == nullptr || remap->cache == nullptr || !remap->cache->enabled()) {
+        return;
+    }
+
+    GGML_ASSERT(a->type == GGML_TYPE_I32);
+    GGML_ASSERT(dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(a));
+    GGML_ASSERT(ggml_is_contiguous(dst));
+
+    const int64_t n = ggml_nelements(a);
+    const int32_t * logical = static_cast<const int32_t *>(a->data);
+    int32_t * slots = static_cast<int32_t *>(dst->data);
+
+    for (int64_t i = 0; i < n; ++i) {
+        slots[i] = remap->cache->ensure_resident(remap->layer_id, logical[i], remap->n_experts);
+    }
+}
+
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     if (cparams.embeddings   &&
        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
@@ -1071,18 +1102,15 @@ ggml_tensor * llm_graph_context::build_moe_gpu_slot_ids(
         return logical_experts;
     }
 
-    auto inp = std::make_unique<llm_graph_input_moe_gpu_slot_map>(
-            moe_gpu_expert_cache, il, n_expert, logical_experts->ne[1]);
+    auto remap = std::make_unique<llm_moe_gpu_slot_remap_userdata>();
+    remap->cache = const_cast<llama_moe_gpu_expert_cache *>(moe_gpu_expert_cache);
+    remap->layer_id = il;
+    remap->n_experts = (int32_t) n_expert;
 
-    inp->slot_map = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, 1, n_expert, logical_experts->ne[1]);
-    ggml_set_input(inp->slot_map);
-    ggml_format_name(inp->slot_map, "ffn_moe_gpu_slot_map-%d", il);
+    llm_moe_gpu_slot_remap_userdata * remap_ptr = remap.get();
+    moe_gpu_slot_remap_userdata.push_back(std::move(remap));
 
-    ggml_tensor * slot_map = inp->slot_map;
-    res->add_input(std::move(inp));
-
-    ggml_tensor * slot_ids = ggml_get_rows(ctx0, slot_map, logical_experts);
-    slot_ids = ggml_reshape_2d(ctx0, slot_ids, logical_experts->ne[0], logical_experts->ne[1]);
+    ggml_tensor * slot_ids = ggml_map_custom1(ctx0, logical_experts, llm_moe_gpu_slot_remap, 1, remap_ptr);
     cb(slot_ids, "ffn_moe_gpu_slot_ids", il);
 
     return slot_ids;
@@ -1529,7 +1557,30 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     ggml_tensor * weights = ggml_get_rows(ctx0, probs, selected_experts); // [1, n_expert_used, n_tokens]
     cb(weights, "ffn_moe_weights", il);
 
-    ggml_tensor * selected_experts_compute = build_moe_gpu_slot_ids(selected_experts, n_expert, il);
+    const bool moe_gpu_slot_full_layer =
+        moe_gpu_expert_cache != nullptr &&
+        moe_gpu_expert_cache->enabled() &&
+        moe_gpu_expert_cache->size() >= n_expert;
+    // Partial slot banks cannot safely serve a single mul_mat_id graph unless all
+    // experts referenced by that op are resident for the full op lifetime. Keep
+    // compute remapping to full-slot mode until partial-slot execution is split.
+    const bool use_moe_gpu_slot_cache = moe_gpu_slot_full_layer;
+
+    ggml_tensor * selected_experts_compute = selected_experts;
+
+    if (use_moe_gpu_slot_cache && moe_gpu_expert_cache != nullptr) {
+        up_exps        = moe_gpu_expert_cache->compute_tensor(up_exps);
+        gate_exps      = moe_gpu_expert_cache->compute_tensor(gate_exps);
+        down_exps      = moe_gpu_expert_cache->compute_tensor(down_exps);
+        gate_up_exps   = moe_gpu_expert_cache->compute_tensor(gate_up_exps);
+        up_exps_s      = moe_gpu_expert_cache->compute_tensor(up_exps_s);
+        gate_exps_s    = moe_gpu_expert_cache->compute_tensor(gate_exps_s);
+        down_exps_s    = moe_gpu_expert_cache->compute_tensor(down_exps_s);
+        up_exps_b      = moe_gpu_expert_cache->compute_tensor(up_exps_b);
+        gate_exps_b    = moe_gpu_expert_cache->compute_tensor(gate_exps_b);
+        down_exps_b    = moe_gpu_expert_cache->compute_tensor(down_exps_b);
+        gate_up_exps_b = moe_gpu_expert_cache->compute_tensor(gate_up_exps_b);
+    }
 
     if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX_WEIGHT) {
         weights = ggml_reshape_2d(ctx0, weights, n_expert_used, n_tokens);
@@ -1585,8 +1636,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // apply per-expert scale2 to merged gate_up (use up_exps_s since gate and up are fused)
         if (up_exps_s) {
-            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
-            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+            const int64_t n_expert_compute = ggml_nelements(up_exps_s);
+            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert_compute, 1);
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert_compute, n_tokens, 1);
             s = ggml_get_rows(ctx0, s, selected_experts_compute); // [1, n_expert_used, n_tokens]
             gate_up = ggml_mul(ctx0, gate_up, s);
             cb(gate_up, "ffn_moe_gate_up_scaled", il);
@@ -1609,8 +1661,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // apply per-expert scale2 to up
         if (up_exps_s) {
-            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert, 1);
-            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+            const int64_t n_expert_compute = ggml_nelements(up_exps_s);
+            ggml_tensor * s = ggml_reshape_3d(ctx0, up_exps_s, 1, n_expert_compute, 1);
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert_compute, n_tokens, 1);
             s = ggml_get_rows(ctx0, s, selected_experts_compute); // [1, n_expert_used, n_tokens]
             up = ggml_mul(ctx0, up, s);
             cb(up, "ffn_moe_up_scaled", il);
@@ -1630,8 +1683,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
         // apply per-expert scale2 to gate
         if (gate_exps_s) {
-            ggml_tensor * s = ggml_reshape_3d(ctx0, gate_exps_s, 1, n_expert, 1);
-            s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+            const int64_t n_expert_compute = ggml_nelements(gate_exps_s);
+            ggml_tensor * s = ggml_reshape_3d(ctx0, gate_exps_s, 1, n_expert_compute, 1);
+            s = ggml_repeat_4d(ctx0, s, 1, n_expert_compute, n_tokens, 1);
             s = ggml_get_rows(ctx0, s, selected_experts_compute); // [1, n_expert_used, n_tokens]
             cur = ggml_mul(ctx0, cur, s);
             cb(cur, "ffn_moe_gate_scaled", il);
@@ -1717,8 +1771,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     // apply per-expert scale2 to down
     if (down_exps_s) {
-        ggml_tensor * s = ggml_reshape_3d(ctx0, down_exps_s, 1, n_expert, 1);
-        s = ggml_repeat_4d(ctx0, s, 1, n_expert, n_tokens, 1);
+        const int64_t n_expert_compute = ggml_nelements(down_exps_s);
+        ggml_tensor * s = ggml_reshape_3d(ctx0, down_exps_s, 1, n_expert_compute, 1);
+        s = ggml_repeat_4d(ctx0, s, 1, n_expert_compute, n_tokens, 1);
         s = ggml_get_rows(ctx0, s, selected_experts_compute); // [1, n_expert_used, n_tokens]
         experts = ggml_mul(ctx0, experts, s);
         cb(experts, "ffn_moe_down_scaled", il);

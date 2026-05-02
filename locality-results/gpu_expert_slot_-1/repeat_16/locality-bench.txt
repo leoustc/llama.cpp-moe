@@ -6,13 +6,13 @@ Prompt groups:                     1
 Repeats per prompt:                16
 Total requests:                    16
 Parallel requests:                 2
-Benchmark duration:                37.00 s
-Request throughput:                0.43 requests/s = 25.95 requests/min
+Benchmark duration:                40.89 s
+Request throughput:                0.39 requests/s = 23.48 requests/min
 Total prompt length:               608 tokens
 Average prompt length:             38.00 tokens
-Average prompt latency:            646.61 ms
-Average prompt speed:              58.77 tokens/s
+Average prompt latency:            778.55 ms
+Average prompt speed:              48.81 tokens/s
 Total generated tokens:            1024
 Average generation depth:          70.50 tokens
-Average total generation speed:    27.68 tokens/s
-Average generation speed per slot: 13.84 tokens/s / slot
+Average total generation speed:    25.05 tokens/s
+Average generation speed per slot: 12.52 tokens/s / slot

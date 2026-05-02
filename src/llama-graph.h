@@ -20,6 +20,12 @@ struct llama_cparams;
 struct llama_layer;
 struct llama_moe_gpu_expert_cache;
 
+struct llm_moe_gpu_slot_remap_userdata {
+    llama_moe_gpu_expert_cache * cache = nullptr;
+    int32_t layer_id = -1;
+    int32_t n_experts = 0;
+};
+
 struct llama_memory_context_i;
 
 class llama_kv_cache_context;
@@ -780,9 +786,10 @@ struct llm_graph_context {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
-            const llama_memory_context_i * mctx;
-            const llama_cross            * cross;
+    const llama_memory_context_i * mctx;
+    const llama_cross            * cross;
     const llama_moe_gpu_expert_cache * moe_gpu_expert_cache;
+    mutable std::vector<std::unique_ptr<llm_moe_gpu_slot_remap_userdata>> moe_gpu_slot_remap_userdata;
 
     std::map<llama_seq_id, llama_sampler *> samplers;
 
