@@ -217,9 +217,250 @@ static int32_t llama_moe_expert_count_from_layer(const llama_layer & layer) {
     return -1;
 }
 
+struct llama_moe_layer_preload_info {
+    int32_t layer_id = -1;
+    int32_t n_experts = 0;
+};
+
+static int32_t llama_moe_gpu_expert_slot_effective_count(const llama_model & model, int32_t requested_slots) {
+    if (requested_slots < 0 || model.hparams.n_expert == 0) {
+        return 0;
+    }
+
+    const int32_t active_experts = (int32_t) model.hparams.n_expert_used;
+    const int32_t total_experts  = (int32_t) model.hparams.n_expert;
+
+    if (active_experts <= 0 || total_experts <= 0) {
+        return 0;
+    }
+
+    if (requested_slots == 0) {
+        return active_experts;
+    }
+
+    return std::clamp(requested_slots, active_experts, total_experts);
+}
+
+static ggml_backend_dev_t llama_moe_gpu_expert_slot_device(const llama_model & model) {
+    for (const auto & dev : model.devices) {
+        if (dev.is_meta) {
+            continue;
+        }
+        if (ggml_backend_dev_buffer_type(dev.dev) != ggml_backend_cpu_buffer_type()) {
+            return dev.dev;
+        }
+    }
+    return nullptr;
+}
+
+static bool llama_moe_gpu_expert_slot_slice_shape(
+        const ggml_tensor * src,
+        int32_t n_experts,
+        int32_t expert_id,
+        int64_t dst_ne[GGML_MAX_DIMS],
+        size_t & src_offset,
+        size_t & src_nbytes) {
+    if (src == nullptr || n_experts <= 0 || expert_id < 0 || expert_id >= n_experts) {
+        return false;
+    }
+
+    int expert_dim = -1;
+    for (int i = GGML_MAX_DIMS - 1; i >= 1; --i) {
+        if (src->ne[i] == n_experts) {
+            expert_dim = i;
+            break;
+        }
+    }
+    if (expert_dim < 0 || expert_id >= src->ne[expert_dim]) {
+        return false;
+    }
+
+    int dst_dim = 0;
+    for (int i = 0; i < GGML_MAX_DIMS; ++i) {
+        if (i == expert_dim) {
+            continue;
+        }
+        dst_ne[dst_dim++] = src->ne[i];
+    }
+    while (dst_dim < GGML_MAX_DIMS) {
+        dst_ne[dst_dim++] = 1;
+    }
+
+    src_offset = (size_t) expert_id * src->nb[expert_dim];
+    src_nbytes = src->nb[expert_dim];
+    return src_nbytes > 0;
+}
+
+static ggml_tensor * llama_moe_gpu_expert_slot_new_tensor(
+        ggml_context * ctx,
+        const ggml_tensor * src,
+        const int64_t ne[GGML_MAX_DIMS]) {
+    if (ne[3] > 1) {
+        return ggml_new_tensor_4d(ctx, src->type, ne[0], ne[1], ne[2], ne[3]);
+    }
+    if (ne[2] > 1) {
+        return ggml_new_tensor_3d(ctx, src->type, ne[0], ne[1], ne[2]);
+    }
+    if (ne[1] > 1) {
+        return ggml_new_tensor_2d(ctx, src->type, ne[0], ne[1]);
+    }
+    return ggml_new_tensor_1d(ctx, src->type, ne[0]);
+}
+
+static void llama_moe_gpu_expert_slot_add_tensor(
+        llama_moe_gpu_expert_slot & slot,
+        const ggml_tensor * src,
+        int32_t n_experts,
+        int32_t expert_id) {
+    int64_t dst_ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
+    size_t src_offset = 0;
+    size_t src_nbytes = 0;
+    if (!llama_moe_gpu_expert_slot_slice_shape(src, n_experts, expert_id, dst_ne, src_offset, src_nbytes)) {
+        return;
+    }
+
+    ggml_tensor * dst = llama_moe_gpu_expert_slot_new_tensor(slot.ctx.get(), src, dst_ne);
+    ggml_format_name(dst, "moe_slot.%d.%s", (int) slot.tensors.size(), src->name);
+    slot.tensors.push_back({ dst->name, const_cast<ggml_tensor *>(src), dst, src_nbytes });
+}
+
+static bool llama_moe_gpu_expert_slot_copy_tensor(
+        const llama_moe_gpu_expert_slot_tensor & slot_tensor,
+        int32_t n_experts,
+        int32_t expert_id) {
+    int64_t dst_ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
+    size_t src_offset = 0;
+    size_t src_nbytes = 0;
+    if (!llama_moe_gpu_expert_slot_slice_shape(slot_tensor.src, n_experts, expert_id, dst_ne, src_offset, src_nbytes)) {
+        return false;
+    }
+
+    const size_t dst_nbytes = ggml_nbytes(slot_tensor.dev);
+    if (src_nbytes != dst_nbytes || slot_tensor.nbytes != dst_nbytes) {
+        LLAMA_LOG_WARN("%s: MoE GPU expert slot tensor size mismatch: %s source=%zu slot=%zu\n",
+                __func__, slot_tensor.src->name, src_nbytes, dst_nbytes);
+        return false;
+    }
+
+    std::vector<uint8_t> data(dst_nbytes);
+    ggml_backend_tensor_get(slot_tensor.src, data.data(), src_offset, dst_nbytes);
+    ggml_backend_tensor_set(slot_tensor.dev, data.data(), 0, dst_nbytes);
+    return true;
+}
+
+static bool llama_moe_gpu_expert_slot_materialize(
+        llama_model & model,
+        int32_t slot_id,
+        int32_t layer_id,
+        int32_t expert_id,
+        int32_t n_experts) {
+    if (slot_id < 0 || slot_id >= model.moe_gpu_expert_cache.size()) {
+        return false;
+    }
+
+    ggml_backend_dev_t dev = llama_moe_gpu_expert_slot_device(model);
+    if (dev == nullptr) {
+        LLAMA_LOG_WARN("%s: no GPU backend device available for MoE GPU expert slot allocation\n", __func__);
+        return false;
+    }
+
+    auto * slot_ptr = model.moe_gpu_expert_cache.slot_at(layer_id, slot_id);
+    if (slot_ptr == nullptr) {
+        LLAMA_LOG_WARN("%s: invalid MoE GPU expert slot: layer=%d slot=%d expert=%d\n", __func__, layer_id, slot_id, expert_id);
+        return false;
+    }
+
+    auto & slot = *slot_ptr;
+    if (slot.resident &&
+        slot.layer_id == layer_id &&
+        slot.expert_id == expert_id &&
+        slot.buf &&
+        !slot.tensors.empty()) {
+        LLAMA_LOG_INFO("%s: MoE GPU expert slot hit: slot=%d layer=%d expert=%d tensors=%zu; skip CPU copy\n",
+                __func__, slot_id, layer_id, expert_id, slot.tensors.size());
+        return true;
+    }
+
+    slot.clear_storage();
+
+    const llama_layer & layer = model.layers.at(layer_id);
+    const ggml_tensor * sources[] = {
+        layer.ffn_gate_exps,
+        layer.ffn_down_exps,
+        layer.ffn_up_exps,
+        layer.ffn_gate_up_exps,
+        layer.ffn_gate_exps_b,
+        layer.ffn_down_exps_b,
+        layer.ffn_up_exps_b,
+        layer.ffn_gate_up_exps_b,
+        layer.ffn_gate_exps_s,
+        layer.ffn_down_exps_s,
+        layer.ffn_up_exps_s,
+    };
+
+    int n_slot_tensors = 0;
+    for (const ggml_tensor * src : sources) {
+        int64_t dst_ne[GGML_MAX_DIMS] = { 1, 1, 1, 1 };
+        size_t src_offset = 0;
+        size_t src_nbytes = 0;
+        if (llama_moe_gpu_expert_slot_slice_shape(src, n_experts, expert_id, dst_ne, src_offset, src_nbytes)) {
+            ++n_slot_tensors;
+        }
+    }
+    if (n_slot_tensors == 0) {
+        LLAMA_LOG_WARN("%s: no source tensors found for MoE GPU expert slot: layer=%d expert=%d\n", __func__, layer_id, expert_id);
+        return false;
+    }
+
+    struct ggml_init_params ctx_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * n_slot_tensors,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    slot.ctx.reset(ggml_init(ctx_params));
+    if (!slot.ctx) {
+        LLAMA_LOG_WARN("%s: failed to create MoE GPU expert slot context\n", __func__);
+        return false;
+    }
+
+    for (const ggml_tensor * src : sources) {
+        llama_moe_gpu_expert_slot_add_tensor(slot, src, n_experts, expert_id);
+    }
+    if (slot.tensors.empty()) {
+        slot.clear_storage();
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_dev_buffer_type(dev);
+    slot.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(slot.ctx.get(), buft));
+    if (!slot.buf) {
+        LLAMA_LOG_WARN("%s: failed to allocate MoE GPU expert slot buffer: layer=%d expert=%d tensors=%zu\n",
+                __func__, layer_id, expert_id, slot.tensors.size());
+        slot.clear_storage();
+        return false;
+    }
+
+    size_t copied_bytes = 0;
+    for (const auto & slot_tensor : slot.tensors) {
+        if (llama_moe_gpu_expert_slot_copy_tensor(slot_tensor, n_experts, expert_id)) {
+            copied_bytes += slot_tensor.nbytes;
+        }
+    }
+
+    LLAMA_LOG_INFO("%s: MoE GPU expert slot materialized: slot=%d layer=%d expert=%d tensors=%zu bytes=%.2f MiB buffer=%.2f MiB device=%s\n",
+            __func__, slot_id, layer_id, expert_id, slot.tensors.size(),
+            copied_bytes / 1024.0 / 1024.0,
+            ggml_backend_buffer_get_size(slot.buf.get()) / 1024.0 / 1024.0,
+            ggml_backend_dev_name(dev));
+    return true;
+}
+
 static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
     auto & cache = const_cast<llama_model &>(model).moe_gpu_expert_cache;
+    llama_model & model_mut = const_cast<llama_model &>(model);
+    std::vector<llama_moe_layer_preload_info> moe_layers;
     int64_t step = 1;
+    int32_t max_layer_experts = 0;
 
     for (size_t i = 0; i < model.layers.size(); ++i) {
         const auto & layer = model.layers[i];
@@ -236,30 +477,47 @@ static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
         LLAMA_LOG_INFO("%s: layer %zu: expert tensor layout = %s\n", __func__, i, layout);
         if (n_experts > 0) {
             LLAMA_LOG_INFO("%s: layer %zu: n_experts = %d\n", __func__, i, n_experts);
+            moe_layers.push_back({(int32_t) i, n_experts});
+            max_layer_experts = std::max(max_layer_experts, n_experts);
         } else {
             LLAMA_LOG_INFO("%s: layer %zu: n_experts = unknown\n", __func__, i);
         }
+    }
 
-        if (cache.enabled() && n_experts > 0) {
-            const int32_t layer_id = (int32_t) i;
-            const int32_t expert_id = 0;
+    if (!cache.enabled()) {
+        return;
+    }
+
+    int32_t n_preloaded = 0;
+    for (const llama_moe_layer_preload_info & info : moe_layers) {
+        for (int32_t expert_id = 0; expert_id < max_layer_experts && expert_id < cache.size(); ++expert_id) {
+            if (expert_id >= info.n_experts) {
+                continue;
+            }
+
+            const int32_t layer_id = info.layer_id;
             int32_t slot = cache.find(layer_id, expert_id);
             if (slot >= 0) {
                 slot = cache.preload_or_assign_slot(layer_id, expert_id, step++);
                 LLAMA_LOG_INFO("%s: MoE GPU expert slot preload reuse: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, slot);
+                llama_moe_gpu_expert_slot_materialize(model_mut, slot, layer_id, expert_id, info.n_experts);
+                ++n_preloaded;
                 continue;
             }
 
-            slot = cache.find_free();
+            slot = cache.find_free(layer_id);
             if (slot < 0) {
-                slot = cache.find_lru_victim();
-                if (slot >= 0 && cache.slots[slot].resident) {
+                slot = cache.find_lru_victim(layer_id);
+                const auto * victim = cache.slot_at(layer_id, slot);
+                if (victim != nullptr && victim->resident) {
                     LLAMA_LOG_INFO("%s: MoE GPU expert slot preload replace: slot=%d old_layer=%d old_expert=%d new_layer=%d new_expert=%d\n",
-                            __func__, slot, cache.slots[slot].layer_id, cache.slots[slot].expert_id, layer_id, expert_id);
+                            __func__, slot, victim->layer_id, victim->expert_id, layer_id, expert_id);
                 }
             }
             const int32_t assigned = cache.preload_or_assign_slot(layer_id, expert_id, step++);
             LLAMA_LOG_INFO("%s: MoE GPU expert slot preload: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, assigned >= 0 ? assigned : slot);
+            llama_moe_gpu_expert_slot_materialize(model_mut, assigned >= 0 ? assigned : slot, layer_id, expert_id, info.n_experts);
+            ++n_preloaded;
         }
     }
 }
@@ -490,15 +748,28 @@ static struct llama_model * llama_model_load_from_file_impl(
     }
 
     const int32_t requested_slots = params.n_moe_gpu_expert_slot_num;
-    if (requested_slots <= 0) {
+    if (requested_slots < 0) {
         model->moe_gpu_expert_cache.clear();
     } else if (!llama_model_has_moe_experts(*model)) {
         LLAMA_LOG_INFO("%s: MoE GPU expert slot mode requested, but model has no MoE experts; ignoring\n", __func__);
         model->moe_gpu_expert_cache.clear();
     } else {
-        model->moe_gpu_expert_cache.init(requested_slots);
-        LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots\n", __func__, requested_slots);
-        llama_moe_gpu_expert_slot_preload(*model);
+        const int32_t effective_slots = llama_moe_gpu_expert_slot_effective_count(*model, requested_slots);
+        if (effective_slots <= 0) {
+            LLAMA_LOG_INFO("%s: MoE GPU expert slot mode requested, but expert counts are unavailable; ignoring\n", __func__);
+            model->moe_gpu_expert_cache.clear();
+            return model;
+        }
+
+        LLAMA_LOG_INFO("%s: MoE GPU expert slot count normalized: requested=%d active=%u total=%u effective=%d\n",
+                __func__, requested_slots, model->hparams.n_expert_used, model->hparams.n_expert, effective_slots);
+        model->moe_gpu_expert_cache.init(effective_slots);
+        LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots\n", __func__, effective_slots);
+        if (params.no_alloc) {
+            LLAMA_LOG_INFO("%s: skipping MoE GPU expert slot materialization during no-alloc model fitting pass\n", __func__);
+        } else {
+            llama_moe_gpu_expert_slot_preload(*model);
+        }
     }
 
     return model;

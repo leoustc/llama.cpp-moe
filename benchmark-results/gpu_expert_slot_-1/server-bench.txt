@@ -1,0 +1,15 @@
+Generating random prompts...
+Starting the benchmark...
+
+  0%|          | 0/16 [00:00<?, ?it/s]  6%|▋         | 1/16 [00:04<01:03,  4.25s/it] 19%|█▉        | 3/16 [00:08<00:36,  2.83s/it] 31%|███▏      | 5/16 [00:13<00:27,  2.54s/it] 44%|████▍     | 7/16 [00:18<00:22,  2.45s/it] 56%|█████▋    | 9/16 [00:22<00:16,  2.40s/it] 69%|██████▉   | 11/16 [00:27<00:12,  2.41s/it] 81%|████████▏ | 13/16 [00:32<00:07,  2.47s/it] 94%|█████████▍| 15/16 [00:38<00:02,  2.53s/it]100%|██████████| 16/16 [00:38<00:00,  2.38s/it]
+
+Benchmark duration:                38.07 s
+Request throughput:                0.42 requests/s = 25.22 requests/min
+Total prompt length:               1024 tokens
+Average prompt length:             64.00 tokens
+Average prompt latency:            813.69 ms
+Average prompt speed:              78.65 tokens/s
+Total generated tokens:            1024
+Average generation depth:          96.50 tokens
+Average total generation speed:    26.90 tokens/s
+Average generation speed per slot: 13.45 tokens/s / slot

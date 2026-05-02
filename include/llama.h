@@ -291,7 +291,7 @@ extern "C" {
         const struct llama_model_tensor_buft_override * tensor_buft_overrides;
 
         int32_t n_gpu_layers; // number of layers to store in VRAM, a negative value means all layers
-        int32_t n_moe_gpu_expert_slot_num; // number of GPU-resident MoE expert slots, 0 disables expert-slot mode
+        int32_t n_moe_gpu_expert_slot_num; // -1 disables, 0 uses active expert count, >0 sets GPU expert slots
         enum llama_split_mode split_mode; // how to split the model across multiple GPUs
 
         // the GPU that is used for the entire model when split_mode is LLAMA_SPLIT_MODE_NONE

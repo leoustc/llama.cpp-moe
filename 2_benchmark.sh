@@ -5,10 +5,13 @@ SERVER_URL="${SERVER_URL:-http://127.0.0.1:8071}"
 MODE="${MODE:-throughput}"
 NAME="${NAME:-gemma4-26B-A4B-it-${MODE}}"
 OUT_DIR="${OUT_DIR:-benchmark-results}"
-GPU_EXPERT_SLOT_NUMS="${GPU_EXPERT_SLOT_NUMS:-0 16 32 64 72}"
+GPU_EXPERT_SLOT_NUMS="${GPU_EXPERT_SLOT_NUMS:--1 16 32 64 72}"
 SERVING_SCRIPT="${SERVING_SCRIPT:-./1_serving.sh}"
 HEALTH_TIMEOUT_SECONDS="${HEALTH_TIMEOUT_SECONDS:-900}"
 HEALTH_POLL_SECONDS="${HEALTH_POLL_SECONDS:-5}"
+GPU_MEMORY_POLL_SECONDS="${GPU_MEMORY_POLL_SECONDS:-1}"
+GPU_MEMORY_INDEX="${GPU_MEMORY_INDEX:-0}"
+GPU_MEMORY_SAMPLING="${GPU_MEMORY_SAMPLING:-1}"
 
 case "${MODE}" in
     throughput)
@@ -59,6 +62,8 @@ echo "output dir:     ${OUT_DIR}"
 echo "slot sweep:     ${GPU_EXPERT_SLOT_NUMS}"
 
 SERVER_PID=""
+GPU_MEMORY_PID=""
+GPU_MEMORY_CSV=""
 
 stop_server() {
     if [[ -n "${SERVER_PID}" ]] && kill -0 "${SERVER_PID}" 2>/dev/null; then
@@ -66,9 +71,66 @@ stop_server() {
         wait "${SERVER_PID}" 2>/dev/null || true
     fi
     SERVER_PID=""
+    stop_gpu_memory_sampler
 }
 
 trap stop_server EXIT
+
+start_gpu_memory_sampler() {
+    local slot_out_dir="$1"
+    GPU_MEMORY_CSV="${slot_out_dir}/gpu-memory.csv"
+
+    if [[ "${GPU_MEMORY_SAMPLING}" != "1" ]]; then
+        return 0
+    fi
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        echo "status: unavailable (nvidia-smi not found)" > "${slot_out_dir}/gpu-memory-summary.txt"
+        return 0
+    fi
+
+    echo "timestamp,memory_used_mib,memory_total_mib" > "${GPU_MEMORY_CSV}"
+    (
+        while true; do
+            nvidia-smi \
+                --id="${GPU_MEMORY_INDEX}" \
+                --query-gpu=timestamp,memory.used,memory.total \
+                --format=csv,noheader,nounits \
+                >> "${GPU_MEMORY_CSV}" 2>/dev/null || true
+            sleep "${GPU_MEMORY_POLL_SECONDS}"
+        done
+    ) &
+    GPU_MEMORY_PID="$!"
+}
+
+stop_gpu_memory_sampler() {
+    if [[ -n "${GPU_MEMORY_PID}" ]] && kill -0 "${GPU_MEMORY_PID}" 2>/dev/null; then
+        kill "${GPU_MEMORY_PID}" 2>/dev/null || true
+        wait "${GPU_MEMORY_PID}" 2>/dev/null || true
+    fi
+    GPU_MEMORY_PID=""
+
+    if [[ -n "${GPU_MEMORY_CSV}" && -f "${GPU_MEMORY_CSV}" ]]; then
+        awk -F',' '
+            NR > 1 {
+                gsub(/^[ \t]+|[ \t]+$/, "", $2)
+                gsub(/^[ \t]+|[ \t]+$/, "", $3)
+                if ($2 + 0 > max_used) { max_used = $2 + 0 }
+                if ($3 + 0 > total) { total = $3 + 0 }
+                samples += 1
+            }
+            END {
+                if (samples == 0) {
+                    print "status: unavailable (no GPU memory samples)"
+                } else {
+                    printf "max_memory_used_mib: %d\n", max_used
+                    printf "memory_total_mib: %d\n", total
+                    printf "samples: %d\n", samples
+                }
+            }
+        ' "${GPU_MEMORY_CSV}" > "${GPU_MEMORY_CSV%/*}/gpu-memory-summary.txt"
+    fi
+    GPU_MEMORY_CSV=""
+}
 
 wait_for_health() {
     local elapsed=0
@@ -119,18 +181,19 @@ run_one_slot() {
     local slot_out_dir="${OUT_DIR}/gpu_expert_slot_${slot_num}"
 
     stop_server
+    mkdir -p "${slot_out_dir}"
 
     echo
     echo "============================================================"
     echo "benchmarking MOE_GPU_EXPERT_SLOT_NUM=${slot_num}"
     echo "============================================================"
 
-    MOE_GPU_EXPERT_SLOT_NUM="${slot_num}" "${SERVING_SCRIPT}" &
+    MOE_GPU_EXPERT_SLOT_NUM="${slot_num}" "${SERVING_SCRIPT}" > "${slot_out_dir}/server.log" 2>&1 &
     SERVER_PID="$!"
+    start_gpu_memory_sampler "${slot_out_dir}"
     wait_for_health
     wait_for_completion_ready
 
-    mkdir -p "${slot_out_dir}"
     (
         cd "${slot_out_dir}"
         LLAMA_ARG_N_PARALLEL="${N_PARALLEL}" \
@@ -144,6 +207,7 @@ run_one_slot() {
                 --n_predict_min "${N_PREDICT_MIN}" \
                 2>&1 | tee server-bench.txt
     )
+    stop_gpu_memory_sampler
 }
 
 for slot_num in ${GPU_EXPERT_SLOT_NUMS}; do

@@ -6,6 +6,7 @@
 #include "llama-hparams.h"
 #include "llama-memory.h"
 #include "llama-vocab.h"
+#include "ggml-cpp.h"
 
 #include <map>
 #include <memory>
@@ -509,25 +510,55 @@ struct llama_meta_device_get_split_state_userdata {
 
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
+struct llama_moe_gpu_expert_slot_tensor {
+    std::string name;
+    struct ggml_tensor * src = nullptr;
+    struct ggml_tensor * dev = nullptr;
+    size_t nbytes = 0;
+};
+
 struct llama_moe_gpu_expert_slot {
     int32_t layer_id  = -1;
     int32_t expert_id = -1;
     int64_t last_used = 0;
     bool resident     = false;
+
+    ggml_context_ptr ctx;
+    ggml_backend_buffer_ptr buf;
+    std::vector<llama_moe_gpu_expert_slot_tensor> tensors;
+
+    void clear_storage() {
+        tensors.clear();
+        buf.reset();
+        ctx.reset();
+    }
 };
 
 struct llama_moe_gpu_expert_cache {
     int32_t n_slots = 0;
-    std::vector<llama_moe_gpu_expert_slot> slots;
+
+    // layer id -> layer-local GPU expert slots.
+    // The inner vector index is the physical GPU slot id for that layer.
+    std::unordered_map<int32_t, std::vector<llama_moe_gpu_expert_slot>> slots_by_layer;
+
+    // logical expert id -> layer-local GPU slot id:
+    // (layer_id, expert_id) -> (layer_id, slot_id).
+    std::unordered_map<uint64_t, int32_t> expert_to_slot;
+
     int64_t clock = 0;
     int64_t n_hit = 0;
     int64_t n_miss = 0;
     int64_t n_evict = 0;
 
+    static uint64_t key(int32_t layer_id, int32_t expert_id) {
+        return (uint64_t(uint32_t(layer_id)) << 32) | uint32_t(expert_id);
+    }
+
     void init(int32_t n) {
         n_slots = n > 0 ? n : 0;
-        slots.clear();
-        slots.resize(n_slots);
+        slots_by_layer.clear();
+        expert_to_slot.clear();
+        expert_to_slot.reserve(n_slots);
         clock = 0;
         n_hit = 0;
         n_miss = 0;
@@ -535,8 +566,14 @@ struct llama_moe_gpu_expert_cache {
     }
 
     void clear() {
+        for (auto & layer_slots : slots_by_layer) {
+            for (auto & slot : layer_slots.second) {
+                slot.clear_storage();
+            }
+        }
         n_slots = 0;
-        slots.clear();
+        slots_by_layer.clear();
+        expert_to_slot.clear();
         clock = 0;
         n_hit = 0;
         n_miss = 0;
@@ -555,36 +592,104 @@ struct llama_moe_gpu_expert_cache {
         return n_slots == 0;
     }
 
+    std::vector<llama_moe_gpu_expert_slot> & slots_for_layer(int32_t layer_id) {
+        auto & layer_slots = slots_by_layer[layer_id];
+        if ((int32_t) layer_slots.size() != n_slots) {
+            layer_slots.resize(n_slots);
+        }
+        return layer_slots;
+    }
+
+    const std::vector<llama_moe_gpu_expert_slot> * slots_for_layer(int32_t layer_id) const {
+        const auto it = slots_by_layer.find(layer_id);
+        if (it == slots_by_layer.end()) {
+            return nullptr;
+        }
+        return &it->second;
+    }
+
+    llama_moe_gpu_expert_slot * slot_at(int32_t layer_id, int32_t slot_id) {
+        if (slot_id < 0 || slot_id >= n_slots) {
+            return nullptr;
+        }
+        return &slots_for_layer(layer_id)[slot_id];
+    }
+
+    const llama_moe_gpu_expert_slot * slot_at(int32_t layer_id, int32_t slot_id) const {
+        if (slot_id < 0 || slot_id >= n_slots) {
+            return nullptr;
+        }
+        const auto * layer_slots = slots_for_layer(layer_id);
+        if (layer_slots == nullptr || slot_id >= (int32_t) layer_slots->size()) {
+            return nullptr;
+        }
+        return &(*layer_slots)[slot_id];
+    }
+
     int32_t find(int32_t layer_id, int32_t expert_id) const {
+        const auto it = expert_to_slot.find(key(layer_id, expert_id));
+        if (it == expert_to_slot.end()) {
+            return -1;
+        }
+
+        const int32_t slot_id = it->second;
+        if (slot_id < 0 || slot_id >= n_slots) {
+            return -1;
+        }
+
+        const auto * slot = slot_at(layer_id, slot_id);
+        if (slot == nullptr || !slot->resident || slot->layer_id != layer_id || slot->expert_id != expert_id) {
+            return -1;
+        }
+        return slot_id;
+    }
+
+    int32_t find_free(int32_t layer_id) const {
+        const auto * layer_slots = slots_for_layer(layer_id);
+        if (layer_slots == nullptr) {
+            return 0;
+        }
         for (int32_t i = 0; i < n_slots; ++i) {
-            const auto & slot = slots[i];
-            if (slot.resident && slot.layer_id == layer_id && slot.expert_id == expert_id) {
+            if (!(*layer_slots)[i].resident) {
                 return i;
             }
         }
         return -1;
     }
 
-    int32_t find_free() const {
-        for (int32_t i = 0; i < n_slots; ++i) {
-            if (!slots[i].resident) {
-                return i;
-            }
-        }
-        return -1;
-    }
-
-    int32_t find_lru_victim() const {
+    int32_t find_lru_victim(int32_t layer_id) const {
         if (n_slots <= 0) {
             return -1;
         }
+        const auto * layer_slots = slots_for_layer(layer_id);
+        if (layer_slots == nullptr) {
+            return 0;
+        }
         int32_t victim = 0;
         for (int32_t i = 1; i < n_slots; ++i) {
-            if (slots[i].last_used < slots[victim].last_used) {
+            if ((*layer_slots)[i].last_used < (*layer_slots)[victim].last_used) {
                 victim = i;
             }
         }
         return victim;
+    }
+
+    void assign_slot(int32_t slot_id, int32_t layer_id, int32_t expert_id, int64_t step) {
+        if (slot_id < 0 || slot_id >= n_slots) {
+            return;
+        }
+
+        auto & s = slots_for_layer(layer_id)[slot_id];
+        if (s.resident) {
+            expert_to_slot.erase(key(s.layer_id, s.expert_id));
+            s.clear_storage();
+        }
+
+        s.layer_id = layer_id;
+        s.expert_id = expert_id;
+        s.last_used = step;
+        s.resident = true;
+        expert_to_slot[key(layer_id, expert_id)] = slot_id;
     }
 
     int32_t get_or_assign_slot(int32_t layer_id, int32_t expert_id, int64_t step) {
@@ -593,25 +698,24 @@ struct llama_moe_gpu_expert_cache {
         const int32_t hit_slot = find(layer_id, expert_id);
         if (hit_slot >= 0) {
             ++n_hit;
-            slots[hit_slot].last_used = step;
+            if (auto * slot = slot_at(layer_id, hit_slot)) {
+                slot->last_used = step;
+            }
             return hit_slot;
         }
 
         ++n_miss;
-        int32_t slot = find_free();
+        int32_t slot = find_free(layer_id);
         if (slot < 0) {
-            slot = find_lru_victim();
-            if (slot >= 0 && slots[slot].resident) {
+            slot = find_lru_victim(layer_id);
+            const auto * victim = slot_at(layer_id, slot);
+            if (victim != nullptr && victim->resident) {
                 ++n_evict;
             }
         }
 
         if (slot >= 0) {
-            auto & s = slots[slot];
-            s.layer_id = layer_id;
-            s.expert_id = expert_id;
-            s.last_used = step;
-            s.resident = true;
+            assign_slot(slot, layer_id, expert_id, step);
         }
         return slot;
     }
@@ -621,21 +725,19 @@ struct llama_moe_gpu_expert_cache {
 
         const int32_t hit_slot = find(layer_id, expert_id);
         if (hit_slot >= 0) {
-            slots[hit_slot].last_used = step;
+            if (auto * slot = slot_at(layer_id, hit_slot)) {
+                slot->last_used = step;
+            }
             return hit_slot;
         }
 
-        int32_t slot = find_free();
+        int32_t slot = find_free(layer_id);
         if (slot < 0) {
-            slot = find_lru_victim();
+            slot = find_lru_victim(layer_id);
         }
 
         if (slot >= 0) {
-            auto & s = slots[slot];
-            s.layer_id = layer_id;
-            s.expert_id = expert_id;
-            s.last_used = step;
-            s.resident = true;
+            assign_slot(slot, layer_id, expert_id, step);
         }
         return slot;
     }
