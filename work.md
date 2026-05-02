@@ -2,7 +2,7 @@
 
 This document defines the staged implementation plan for router-aware MoE expert paging in `llama.cpp-moe`.
 
-The goal is to make sparse MoE models run better on memory-constrained GPUs by treating GPU memory as a bounded cache of physical expert slots.
+The goal is to make sparse MoE models run better on memory-constrained GPUs by treating GPU memory as a bounded cache of physical GPU expert slots.
 
 The key idea is simple:
 
@@ -29,7 +29,7 @@ Add and use this CLI flag:
 
 Meaning:
 
-    Configure the maximum number of GPU-resident physical expert slots used for router-aware MoE expert paging.
+    Configure the maximum number of GPU-resident physical GPU expert slots used for router-aware MoE expert paging.
 
 Default:
 
@@ -37,11 +37,15 @@ Default:
 
 Behavior:
 
-    0 disables expert-slot mode and preserves existing llama.cpp behavior.
+    0 disables GPU expert slot mode and preserves existing llama.cpp behavior.
 
 Internal field name:
 
     n_moe_gpu_expert_slot_num
+
+Naming convention:
+
+    Use "GPU expert slot" in user-facing text and `gpu_expert_slot` in internal names.
 
 Important distinction:
 
@@ -55,7 +59,7 @@ These two knobs must remain conceptually separate.
 If `--moe-gpu-expert-slot-num N` is passed for a non-MoE model:
 
 - Do not fail.
-- Do not allocate expert slots.
+- Do not allocate GPU expert slots.
 - Do not change tensor placement.
 - Do not change inference behavior.
 - Ignore the flag safely.
@@ -63,7 +67,7 @@ If `--moe-gpu-expert-slot-num N` is passed for a non-MoE model:
 
     MoE GPU expert slot mode requested, but model has no MoE experts; ignoring
 
-The raw user parameter may remain stored, but the effective runtime expert slot count must become 0 for non-MoE models.
+The raw user parameter may remain stored, but the effective runtime GPU expert slot count must become 0 for non-MoE models.
 
 ## Stage 1: CLI and parameter plumbing
 
@@ -93,7 +97,7 @@ Suggested placement near:
 
 Suggested comment:
 
-    number of GPU-resident MoE expert slots, 0 disables expert-slot mode
+    number of MoE GPU expert slots, 0 disables GPU expert slot mode
 
 2. Add a field to `struct llama_model_params` in `include/llama.h` near `n_gpu_layers`:
 
@@ -114,7 +118,7 @@ Parser behavior:
 - Accept integer N.
 - Reject negative values.
 - 0 means disabled.
-- Positive value enables future expert-slot mode.
+- Positive value enables future GPU expert slot mode.
 
 Handler logic:
 
@@ -124,7 +128,7 @@ Handler logic:
 
 Help text:
 
-    number of GPU-resident MoE expert slots for router-aware expert paging (default: 0, disabled)
+    number of MoE GPU expert slots for router-aware expert paging (default: 0, disabled)
 
 5. Propagate from `common_params` to `llama_model_params` wherever common params are converted to model params:
 
@@ -157,7 +161,7 @@ Suggested commit message:
 
     llama: add MoE GPU expert slot CLI option
 
-## Stage 2: Expert slot cache metadata skeleton
+## Stage 2: GPU Expert Slot Cache Metadata Skeleton
 
 Goal: add internal metadata structures for GPU expert slots. Do not move tensors yet.
 
@@ -197,7 +201,7 @@ Initialization policy:
 
 - If `n_moe_gpu_expert_slot_num <= 0`, cache is disabled.
 - If `n_moe_gpu_expert_slot_num > 0` and model is not MoE, ignore the flag and keep cache disabled.
-- If `n_moe_gpu_expert_slot_num > 0` and model is MoE, initialize N empty physical expert slots.
+- If `n_moe_gpu_expert_slot_num > 0` and model is MoE, initialize N physical GPU expert slots and preload a deterministic initial GPU expert slot set at startup.
 
 MoE detection helper:
 
@@ -228,6 +232,7 @@ For non-MoE models with the flag set:
 For MoE models with the flag set:
 
     initialized MoE GPU expert slot cache with N slots
+    MoE GPU expert slot preload: layer=L expert=E slot=S
 
 Validation:
 
@@ -242,7 +247,7 @@ Expected:
 - no crash
 - inference works
 - flag is ignored
-- no expert slots allocated
+- no GPU expert slots allocated
 
 MoE smoke test:
 
@@ -252,7 +257,7 @@ Expected:
 
 - no crash
 - inference works
-- cache initializes with 16 empty slots
+- cache initializes with 16 GPU expert slots and preloads the startup GPU expert slot set
 - no inference behavior change yet
 
 Suggested commit message:
@@ -314,11 +319,11 @@ If `n_experts` cannot be derived reliably, add conservative placeholder metadata
 
 Suggested commit message:
 
-    llama: index MoE expert tensors for expert slot paging
+    llama: index MoE expert tensors for GPU expert slot paging
 
-## Stage 4: Expert slot hit/miss accounting
+## Stage 4: GPU Expert Slot Hit/Miss Accounting
 
-Goal: implement slot lookup and hit/miss accounting. Do not copy tensors yet.
+Goal: implement GPU expert slot lookup and hit/miss accounting. Do not copy tensors yet.
 
 Add cache operations:
 
@@ -335,9 +340,9 @@ Add counters:
 
 Expected debug logs:
 
-    MoE expert slot hit: layer=L expert=E slot=S
-    MoE expert slot miss: layer=L expert=E slot=S
-    MoE expert slot evict: slot=S old_layer=L0 old_expert=E0 new_layer=L1 new_expert=E1
+    MoE GPU expert slot hit: layer=L expert=E slot=S
+    MoE GPU expert slot miss: layer=L expert=E slot=S
+    MoE GPU expert slot evict: slot=S old_layer=L0 old_expert=E0 new_layer=L1 new_expert=E1
 
 Find where router-selected expert IDs become available in graph construction or MoE forward code.
 
@@ -345,17 +350,17 @@ If selected expert IDs are not easily available yet, add a narrow internal hook 
 
 Suggested commit message:
 
-    llama: add MoE expert slot hit miss accounting
+    llama: add MoE GPU expert slot hit miss accounting
 
 ## Stage 5: CPU-resident expert policy preparation
 
-Goal: prepare policy for keeping MoE expert tensors host-resident when expert-slot mode is enabled.
+Goal: prepare policy for keeping MoE expert tensors host-resident when GPU expert slot mode is enabled.
 
 Design target:
 
 - router and non-expert/shared tensors can stay under normal llama.cpp offload behavior
-- MoE expert tensors can be kept CPU-resident by default when expert-slot mode is enabled
-- selected missing experts will later be copied into GPU slots
+- MoE expert tensors can be kept CPU-resident by default when GPU expert slot mode is enabled
+- selected missing experts will later be copied into GPU expert slots
 
 Add a policy helper such as:
 
@@ -371,7 +376,7 @@ At this stage, add logs first and avoid broad tensor placement changes until ten
 
 Example log:
 
-    MoE expert-slot mode: expert tensor candidate kept host-resident: NAME
+    MoE GPU expert slot mode: expert tensor candidate kept host-resident: NAME
 
 Suggested commit message:
 
@@ -401,7 +406,7 @@ Before coding real movement, inspect:
 
 Possible complication:
 
-If all experts are packed into one large tensor, physical expert slots may require slicing source expert regions from the packed CPU tensor and copying them into smaller GPU slot tensors. If the graph expects a packed tensor, slot replacement may require graph rewrite.
+If all experts are packed into one large tensor, physical GPU expert slots may require slicing source expert regions from the packed CPU tensor and copying them into smaller GPU expert slot tensors. If the graph expects a packed tensor, GPU expert slot replacement may require graph rewrite.
 
 If implementation is unsafe, stop and write a design note instead:
 
@@ -411,7 +416,7 @@ The design note should explain:
 
 - where selected expert IDs are available
 - how expert tensors are packed
-- how to allocate GPU slot tensors
+- how to allocate GPU expert slot tensors
 - how to patch graph inputs safely
 - what backend APIs are needed
 
@@ -433,7 +438,7 @@ Suggested commit message for safe hook implementation:
 
 3. Non-MoE models must continue to work.
 
-4. Passing a positive expert slot number to a non-MoE model must be ignored safely.
+4. Passing a positive GPU expert slot number to a non-MoE model must be ignored safely.
 
 5. Do not rename existing llama.cpp flags.
 
@@ -444,13 +449,13 @@ Suggested commit message for safe hook implementation:
 8. Keep this distinction clear:
 
     n_gpu_layers controls layer residency/offload.
-    n_moe_gpu_expert_slot_num controls bounded GPU expert-slot residency.
+    n_moe_gpu_expert_slot_num controls bounded GPU expert slot residency.
 
 9. Add comments where useful:
 
     MoE expert paging
     logical expert id -> physical GPU expert slot
-    0 disables expert-slot mode
+    0 disables GPU expert slot mode
 
 10. After each stage, run:
 
@@ -467,14 +472,14 @@ Suggested commit message for safe hook implementation:
             -> llama_model.moe_gpu_expert_cache
             -> MoE expert tensor index
             -> router-selected expert IDs
-            -> expert slot lookup
+            -> GPU expert slot lookup
             -> hit: use resident GPU expert slot
             -> miss: page missing expert from CPU to GPU slot
             -> expert compute
 
 This follows the same high-level design as the previous vllm-moe Case 2 work:
 
-- GPU memory is a bounded expert cache.
+- GPU memory is a bounded GPU expert slot cache.
 - CPU memory holds the full expert pool.
 - Router-selected missing experts are moved on demand.
 - Hot experts remain resident and are reused.

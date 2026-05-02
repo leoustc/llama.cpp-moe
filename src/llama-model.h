@@ -615,6 +615,30 @@ struct llama_moe_gpu_expert_cache {
         }
         return slot;
     }
+
+    int32_t preload_or_assign_slot(int32_t layer_id, int32_t expert_id, int64_t step) {
+        clock = std::max(clock, step);
+
+        const int32_t hit_slot = find(layer_id, expert_id);
+        if (hit_slot >= 0) {
+            slots[hit_slot].last_used = step;
+            return hit_slot;
+        }
+
+        int32_t slot = find_free();
+        if (slot < 0) {
+            slot = find_lru_victim();
+        }
+
+        if (slot >= 0) {
+            auto & s = slots[slot];
+            s.layer_id = layer_id;
+            s.expert_id = expert_id;
+            s.last_used = step;
+            s.resident = true;
+        }
+        return slot;
+    }
 };
 
 struct llama_model {

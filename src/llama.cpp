@@ -217,7 +217,7 @@ static int32_t llama_moe_expert_count_from_layer(const llama_layer & layer) {
     return -1;
 }
 
-static void llama_log_moe_expert_tensor_index(const llama_model & model) {
+static void llama_moe_gpu_expert_slot_preload(const llama_model & model) {
     auto & cache = const_cast<llama_model &>(model).moe_gpu_expert_cache;
     int64_t step = 1;
 
@@ -242,23 +242,24 @@ static void llama_log_moe_expert_tensor_index(const llama_model & model) {
 
         if (cache.enabled() && n_experts > 0) {
             const int32_t layer_id = (int32_t) i;
-            const int32_t expert_id = 0; // synthetic Stage-4 hook until router-selected IDs are wired
-            const int32_t hit_slot = cache.find(layer_id, expert_id);
-            if (hit_slot >= 0) {
-                cache.get_or_assign_slot(layer_id, expert_id, step++);
-                LLAMA_LOG_INFO("%s: MoE expert slot hit: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, hit_slot);
-            } else {
-                int32_t slot = cache.find_free();
-                if (slot < 0) {
-                    slot = cache.find_lru_victim();
-                    if (slot >= 0 && cache.slots[slot].resident) {
-                        LLAMA_LOG_INFO("%s: MoE expert slot evict: slot=%d old_layer=%d old_expert=%d new_layer=%d new_expert=%d\n",
-                                __func__, slot, cache.slots[slot].layer_id, cache.slots[slot].expert_id, layer_id, expert_id);
-                    }
-                }
-                const int32_t assigned = cache.get_or_assign_slot(layer_id, expert_id, step++);
-                LLAMA_LOG_INFO("%s: MoE expert slot miss: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, assigned >= 0 ? assigned : slot);
+            const int32_t expert_id = 0;
+            int32_t slot = cache.find(layer_id, expert_id);
+            if (slot >= 0) {
+                slot = cache.preload_or_assign_slot(layer_id, expert_id, step++);
+                LLAMA_LOG_INFO("%s: MoE GPU expert slot preload reuse: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, slot);
+                continue;
             }
+
+            slot = cache.find_free();
+            if (slot < 0) {
+                slot = cache.find_lru_victim();
+                if (slot >= 0 && cache.slots[slot].resident) {
+                    LLAMA_LOG_INFO("%s: MoE GPU expert slot preload replace: slot=%d old_layer=%d old_expert=%d new_layer=%d new_expert=%d\n",
+                            __func__, slot, cache.slots[slot].layer_id, cache.slots[slot].expert_id, layer_id, expert_id);
+                }
+            }
+            const int32_t assigned = cache.preload_or_assign_slot(layer_id, expert_id, step++);
+            LLAMA_LOG_INFO("%s: MoE GPU expert slot preload: layer=%d expert=%d slot=%d\n", __func__, layer_id, expert_id, assigned >= 0 ? assigned : slot);
         }
     }
 }
@@ -497,7 +498,7 @@ static struct llama_model * llama_model_load_from_file_impl(
     } else {
         model->moe_gpu_expert_cache.init(requested_slots);
         LLAMA_LOG_INFO("%s: initialized MoE GPU expert slot cache with %d slots\n", __func__, requested_slots);
-        llama_log_moe_expert_tensor_index(*model);
+        llama_moe_gpu_expert_slot_preload(*model);
     }
 
     return model;
