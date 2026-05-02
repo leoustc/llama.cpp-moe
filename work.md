@@ -79,7 +79,8 @@ There are three runtime cases:
 
 For MoE models with `--moe-gpu-expert-slot-num N >= 0`:
 
-- Keep the complete MoE expert weight pool CPU-resident.
+- Keep the complete MoE expert weight pool CPU-resident for partial-slot mode.
+- If the normalized slot count covers all experts in a layer, use the normal packed expert tensor as that layer's GPU slot bank instead of allocating duplicate per-expert slot buffers.
 - Put activation, dense/shared, attention, norm, embedding, and output tensors on GPU when memory allows.
 - Put router/gate tensors on GPU.
 - Normalize the requested slot count at startup before allocation.
@@ -502,6 +503,8 @@ Before allocation:
 Preload policy:
 
 - Use the CPU-resident expert pool as the source of truth.
+- If `effective_slots >= layer_expert_count`, map `(layer_id, expert_id)` to `(layer_id, slot_id)` and use the packed GPU expert tensor as the layer-local slot bank.
+- MoE graph builders must ask the GPU expert slot cache for the compute tensor first, then fall back to the original expert tensor when no slot-bank tensor is available.
 - Select logical experts deterministically, for example layer-major order: `(layer 0, expert 0)`, `(layer 1, expert 0)`, then continue through available layer/expert IDs until `N` slots are filled.
 - Copy selected expert weights into physical GPU expert slot buffers.
 - Record the logical layer/expert identity in the slot metadata.
@@ -555,6 +558,11 @@ Before coding real movement, inspect:
 Possible complication:
 
 If all experts are packed into one large tensor, physical GPU expert slots may require slicing source expert regions from the packed CPU tensor and copying them into smaller GPU expert slot tensors. If the graph expects a packed tensor, GPU expert slot replacement may require graph rewrite.
+
+Current compute rule:
+
+- Full-slot mode (`effective_slots >= layer_expert_count`) can use the packed GPU expert tensor directly because router IDs already match layer-local slot IDs.
+- Partial-slot mode needs a runtime ID-remap and miss-fallback path before it can safely skip CPU expert compute. The graph must map selected logical expert IDs to layer-local slot IDs for hits, page missing experts, and avoid routing an out-of-range logical ID into a smaller packed slot bank.
 
 If implementation is unsafe, stop and write a design note instead:
 

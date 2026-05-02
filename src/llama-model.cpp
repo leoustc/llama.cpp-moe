@@ -3031,6 +3031,25 @@ static bool llama_moe_tensor_is_expert_slot_source(llm_tensor tensor) {
     }
 }
 
+static int32_t llama_moe_gpu_expert_slot_effective_count_for_hparams(const llama_hparams & hparams, int32_t requested_slots) {
+    if (requested_slots < 0 || hparams.n_expert == 0) {
+        return 0;
+    }
+
+    const int32_t active_experts = (int32_t) hparams.n_expert_used;
+    const int32_t total_experts  = (int32_t) hparams.n_expert;
+
+    if (active_experts <= 0 || total_experts <= 0) {
+        return 0;
+    }
+
+    if (requested_slots == 0) {
+        return active_experts;
+    }
+
+    return std::clamp(requested_slots, active_experts, total_experts);
+}
+
 bool llama_model::load_tensors(llama_model_loader & ml) {
     const auto & split_mode   = params.split_mode;
     const auto & use_mlock    = params.use_mlock;
@@ -3038,6 +3057,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
 
     const int n_layer      = hparams.n_layer;
     const bool moe_gpu_expert_slot_mode = params.n_moe_gpu_expert_slot_num >= 0 && hparams.n_expert > 0;
+    const int32_t n_moe_gpu_expert_slot_effective =
+        llama_moe_gpu_expert_slot_effective_count_for_hparams(hparams, params.n_moe_gpu_expert_slot_num);
+    const bool moe_gpu_expert_slot_all_resident =
+        moe_gpu_expert_slot_mode && n_moe_gpu_expert_slot_effective >= (int32_t) hparams.n_expert;
     const int n_gpu_layers = moe_gpu_expert_slot_mode ? n_layer + 1 : this->n_gpu_layers();
 
     const bool use_mmap_buffer = true;
@@ -3046,7 +3069,11 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
     if (moe_gpu_expert_slot_mode) {
         LLAMA_LOG_INFO("%s: MoE GPU expert slot mode enabled; ignoring n_gpu_layers for MoE placement\n", __func__);
-        LLAMA_LOG_INFO("%s: MoE GPU expert slot mode: routed expert tensors stay CPU-resident; dense/shared and router tensors prefer GPU\n", __func__);
+        if (moe_gpu_expert_slot_all_resident) {
+            LLAMA_LOG_INFO("%s: MoE GPU expert slot mode: slot count covers all routed experts; packed expert tensors are the GPU slot bank\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: MoE GPU expert slot mode: routed expert tensors stay CPU-resident; dense/shared and router tensors prefer GPU\n", __func__);
+        }
     }
 
     // build a list of buffer types for the CPU and GPU devices
@@ -3152,7 +3179,10 @@ bool llama_model::load_tensors(llama_model_loader & ml) {
         }
 
         auto create_tensor = [&](const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) -> ggml_tensor * {
-            const bool force_cpu = moe_gpu_expert_slot_mode && llama_moe_tensor_is_expert_slot_source(tn.tensor);
+            const bool force_cpu =
+                moe_gpu_expert_slot_mode &&
+                !moe_gpu_expert_slot_all_resident &&
+                llama_moe_tensor_is_expert_slot_source(tn.tensor);
             const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : force_cpu ? &pimpl->cpu_buft_list : pimpl->dev_layer.at(tn.bid).buft_list;
             return ml.create_tensor(
                 hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,

@@ -545,6 +545,10 @@ struct llama_moe_gpu_expert_cache {
     // (layer_id, expert_id) -> (layer_id, slot_id).
     std::unordered_map<uint64_t, int32_t> expert_to_slot;
 
+    // Source expert tensor -> tensor used as the first compute source.
+    // Full-slot mode can use the original packed GPU tensor as the slot bank.
+    std::unordered_map<const ggml_tensor *, ggml_tensor *> compute_tensor_by_src;
+
     int64_t clock = 0;
     int64_t n_hit = 0;
     int64_t n_miss = 0;
@@ -558,6 +562,7 @@ struct llama_moe_gpu_expert_cache {
         n_slots = n > 0 ? n : 0;
         slots_by_layer.clear();
         expert_to_slot.clear();
+        compute_tensor_by_src.clear();
         expert_to_slot.reserve(n_slots);
         clock = 0;
         n_hit = 0;
@@ -574,6 +579,7 @@ struct llama_moe_gpu_expert_cache {
         n_slots = 0;
         slots_by_layer.clear();
         expert_to_slot.clear();
+        compute_tensor_by_src.clear();
         clock = 0;
         n_hit = 0;
         n_miss = 0;
@@ -590,6 +596,24 @@ struct llama_moe_gpu_expert_cache {
 
     bool empty() const {
         return n_slots == 0;
+    }
+
+    void register_compute_tensor(const ggml_tensor * src, ggml_tensor * compute) {
+        if (src != nullptr && compute != nullptr) {
+            compute_tensor_by_src[src] = compute;
+        }
+    }
+
+    ggml_tensor * compute_tensor(const ggml_tensor * src) const {
+        if (src == nullptr) {
+            return nullptr;
+        }
+
+        const auto it = compute_tensor_by_src.find(src);
+        if (it == compute_tensor_by_src.end()) {
+            return const_cast<ggml_tensor *>(src);
+        }
+        return it->second;
     }
 
     std::vector<llama_moe_gpu_expert_slot> & slots_for_layer(int32_t layer_id) {

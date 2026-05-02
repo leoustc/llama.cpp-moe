@@ -1,0 +1,1 @@
+{"request_id": 0, "group_id": 0, "repeat_id": 0, "t_submit": 1777705668.7145278, "first_token_time": 1777705669.3006413, "token_arrival_times": [0.5868074893951416], "generated_tokens": 1, "error": null, "prompt_length": 38, "first_token_latency_ms": 586.113452911377}

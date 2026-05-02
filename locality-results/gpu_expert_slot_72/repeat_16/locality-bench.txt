@@ -1,0 +1,18 @@
+Generating repeated prompts...
+Starting the locality benchmark...
+
+Benchmark name:                    gemma4-26B-A4B-it-locality-gpu-expert-slot-72-repeat-16
+Prompt groups:                     1
+Repeats per prompt:                16
+Total requests:                    16
+Parallel requests:                 2
+Benchmark duration:                120.42 s
+Request throughput:                0.13 requests/s = 7.97 requests/min
+Total prompt length:               608 tokens
+Average prompt length:             38.00 tokens
+Average prompt latency:            1999.73 ms
+Average prompt speed:              19.00 tokens/s
+Total generated tokens:            1024
+Average generation depth:          70.50 tokens
+Average total generation speed:    8.50 tokens/s
+Average generation speed per slot: 4.25 tokens/s / slot

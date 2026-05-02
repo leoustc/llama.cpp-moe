@@ -1,0 +1,3 @@
+max_memory_used_mib: 38915
+memory_total_mib: 40960
+samples: 16

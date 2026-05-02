@@ -159,17 +159,17 @@ llm_build_gemma4_iswa::llm_build_gemma4_iswa(const llama_model & model, const ll
                     nullptr, // gate_inp
                     nullptr, // up_exps
                     nullptr, // gate_exps
-                    model.layers[il].ffn_down_exps,
+                    model.moe_gpu_expert_cache.compute_tensor(model.layers[il].ffn_down_exps),
                     nullptr, // exp_probs_b (not used for gemma4)
                     n_expert, n_expert_used,
                     LLM_FFN_GELU, true,
                     1.0f,
                     LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX,
                     il, logits,
-                    model.layers[il].ffn_gate_up_exps,
+                    model.moe_gpu_expert_cache.compute_tensor(model.layers[il].ffn_gate_up_exps),
                     nullptr, // up_exps_s
                     nullptr, // gate_exps_s
-                    model.layers[il].ffn_down_exps_s);
+                    model.moe_gpu_expert_cache.compute_tensor(model.layers[il].ffn_down_exps_s));
             cur_moe = build_norm(cur_moe,
                     model.layers[il].ffn_post_norm_2, nullptr,
                     LLM_NORM_RMS, il);
